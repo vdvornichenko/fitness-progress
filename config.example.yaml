@@ -1,0 +1,30 @@
+# Fitness Progress — example configuration
+# Copy to your output folder as config.yaml and adjust as needed.
+
+# Output canvas (portrait)
+output_width: 1080
+output_height: 1920
+
+# Shoulder alignment targets in output canvas pixels
+target_shoulder_midpoint_x: 540
+target_shoulder_midpoint_y: 620
+
+# Target shoulder width in output canvas pixels.
+# null  → auto-compute from the median of all detected images (recommended)
+# 420   → fixed value from the original plan (tighter crop)
+target_shoulder_width: null
+
+# How aggressively to correct each photo
+max_rotation_degrees: 8.0
+min_scale: 0.75
+max_scale: 1.35
+
+# Shoulder detection quality thresholds
+min_landmark_visibility: 0.5
+min_shoulder_width_px: 80.0
+max_shoulder_angle_abs_degrees: 30.0
+min_margin_from_edge_px: 20
+
+# Video rendering (Phase 2)
+frame_duration_seconds: 0.8
+fps: 30
