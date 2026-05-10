@@ -48,12 +48,16 @@ def build_item(
     capture_date: Optional[datetime],
     detection: "ShoulderDetection",
     transform: Optional["Transform"],
+    media_type: str = "photo",
+    video_timestamp_seconds: Optional[float] = None,
+    video_score: Optional[float] = None,
+    video_score_reason: Optional[str] = None,
 ) -> dict:
     idx = f"{index:04d}"
-    return {
+    item: dict = {
         "id": idx,
+        "media_type": media_type,
         "source_path": str(source_path),
-        "media_type": "photo",
         "capture_date": capture_date.isoformat() if capture_date else None,
         "status": "approved" if detection.detected else "needs_manual_review",
         "pose": _pose_dict(detection),
@@ -69,6 +73,13 @@ def build_item(
             "debug_frame":   str(output_base / "debug"          / f"{idx}_debug.jpg"),
         },
     }
+    if media_type == "video_frame":
+        item["video_selection"] = {
+            "timestamp_seconds": video_timestamp_seconds,
+            "score":             video_score,
+            "reason":            video_score_reason,
+        }
+    return item
 
 
 def save_project(

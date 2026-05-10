@@ -1,5 +1,10 @@
 """
-Phase 3 — Streamlit manual correction editor.
+Streamlit review and correction editor for Fitness Progress.
+
+Accepts a mixed folder of photos (.jpg/.png) and short videos (.mp4/.mov/.m4v).
+Each video is automatically analysed to extract the sharpest, best-posed still
+frame — with portrait-rotation correction and HDR tone-mapping applied — so
+photos and videos work side-by-side as equally valid sources.
 
 Launch from the project root:
     cd fitness-progress-aligner
@@ -8,14 +13,22 @@ Launch from the project root:
 
 Workflow
 --------
-1. Enter the path to your **input photos folder** in the sidebar.
+1. Enter the path to your **input folder** (photos, videos, or both) in the
+   sidebar, or click the folder-browse button.
 2. The output folder is auto-derived (<input_name>_output, next to input).
    Override it if you prefer a different location.
 3. Click **Open / Load Project**.
    - If a project already exists it loads immediately for editing.
-   - Otherwise a **Build** panel appears to run the alignment pipeline.
-4. After building (or loading), use the editor to review and correct frames,
-   then render videos from the sidebar.
+   - Otherwise a **Build** panel appears with pipeline options.
+4. In the Build panel, videos are included by default.  Adjust the sample
+   interval or minimum quality score if needed.
+5. Click **Run Build** and watch the live progress bar track all four phases:
+   Phase 1 (photo detection) → Phase 1b (video extraction) →
+   Phase 2 (photo alignment) → Phase 2b (video alignment).
+6. After building (or loading), use the editor to review and correct items.
+   Photo items: rotation / scale / position sliders.
+   Video items: timestamp slider to re-pick any moment and re-extract the frame.
+7. Click **Render** in the sidebar to produce the final MP4(s).
 
 Preview note
 ------------
@@ -42,10 +55,12 @@ _src = Path(__file__).parent.parent / "src"
 if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
-from progress_aligner.media_import import collect_images
-from progress_aligner.pose import load_rgb
+from progress_aligner.alignment import compute_transform
+from progress_aligner.config import Config
+from progress_aligner.media_import import collect_images, collect_videos
+from progress_aligner.pose import detect_shoulders, load_rgb
 from progress_aligner.transforms import apply_affine, build_affine_matrix, center_crop_to_canvas
-from progress_aligner.video_render import render_aligned, render_comparison, render_original
+from progress_aligner.video_render import render_aligned, render_comparison
 
 # ── Constants ──────────────────────────────────────────────────────────────
 PREVIEW_W     = 324      # preview image width in pixels
@@ -54,7 +69,7 @@ OVERLAY_ALPHA = 0.35
 
 # ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Fitness Progress",
+    page_title="Fitness Progress — Photo & Video Aligner",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -72,6 +87,17 @@ st.markdown("""
 @st.cache_data(show_spinner=False)
 def _load_aligned_bgr(path: str) -> Optional[np.ndarray]:
     return cv2.imread(path)
+
+
+@st.cache_resource(show_spinner=False)
+def _get_pose_model():
+    """Load MediaPipe Pose once and reuse across reruns."""
+    import mediapipe as mp
+    return mp.solutions.pose.Pose(
+        static_image_mode=True,
+        model_complexity=2,
+        min_detection_confidence=0.3,
+    )
 
 
 def _apply_manual_delta(
@@ -105,6 +131,32 @@ def _blend(base: np.ndarray, overlay: np.ndarray, alpha: float) -> np.ndarray:
     if base.shape != overlay.shape:
         overlay = cv2.resize(overlay, (base.shape[1], base.shape[0]))
     return cv2.addWeighted(base, 1.0 - alpha, overlay, alpha, 0)
+
+
+@st.cache_data(show_spinner=False)
+def _load_grid_thumb(path: str) -> Optional[Image.Image]:
+    bgr = cv2.imread(path)
+    if bgr is None:
+        return None
+    # Fixed 180 px wide — tall portrait crop so grid cells stay compact
+    w = 180
+    h, ow = bgr.shape[:2]
+    nh = int(h * w / ow)
+    small = cv2.resize(bgr, (w, nh), interpolation=cv2.INTER_AREA)
+    return Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+
+
+def _select_frame(vi: int) -> None:
+    st.session_state.idx = vi
+
+
+def _toggle_status(vi: int) -> None:
+    """Flip approved ↔ needs_manual_review for item vi and persist."""
+    it = st.session_state.project["items"][vi]
+    it["status"] = (
+        "approved" if it["status"] != "approved" else "needs_manual_review"
+    )
+    _save_project(st.session_state.project, st.session_state.project_path)
 
 
 def _save_project(project: dict, path: str) -> None:
@@ -229,8 +281,8 @@ with st.sidebar:
     in_row_l, in_row_r = st.columns([5, 1])
     with in_row_l:
         st.text_input(
-            "Input photos folder",
-            placeholder="/path/to/photos",
+            "Input folder (photos & videos)",
+            placeholder="/path/to/media",
             key="input_val",
         )
     with in_row_r:
@@ -260,7 +312,7 @@ with st.sidebar:
     # If user cleared the field, fall back to auto
     effective_output = output_val.strip() or auto_out
 
-    open_clicked = st.button("📂 Open / Load Project", use_container_width=True)
+    open_clicked = st.button("📂 Open / Load Project", width="stretch")
 
 # ── Handle Open button ─────────────────────────────────────────────────────
 
@@ -286,10 +338,12 @@ if open_clicked:
             )
         else:
             images = collect_images(in_p)
+            videos_found = collect_videos(in_p)
             st.session_state.build_ready = {
                 "input":    str(in_p),
                 "output":   str(out_p),
                 "n_images": len(images),
+                "n_videos": len(videos_found),
             }
             # Clear any stale project from a previous load
             st.session_state.pop("project", None)
@@ -304,20 +358,27 @@ if build_info and "project" not in st.session_state:
         st.markdown("**Build Pipeline**")
 
         n_img = build_info["n_images"]
-        if n_img:
-            st.info(f"{n_img} images found — no project yet.")
-        else:
-            st.warning("No JPG/PNG images found in that folder.")
+        n_vid = build_info.get("n_videos", 0)
 
-        build_debug    = st.toggle("Save debug frames",           value=False, key="build_debug")
-        build_skip_rnd = st.toggle("Skip rendering after build",  value=True,  key="build_skip_rnd")
-        build_aln_only = st.toggle("Aligned only (skip original)", value=True, key="build_aln_only")
+        if n_img or n_vid:
+            parts = []
+            if n_img:
+                parts.append(f"{n_img} photo(s)")
+            if n_vid:
+                parts.append(f"{n_vid} video(s)")
+            st.info(", ".join(parts) + " found — no project yet.")
+        else:
+            st.warning("No photos or videos found in that folder.")
+
+        build_videos   = st.toggle("Process videos (.mp4/.mov/.m4v)", value=True,  key="build_videos")
+        build_debug    = st.toggle("Save debug frames",               value=False, key="build_debug")
+        build_skip_rnd = st.toggle("Skip rendering after build",      value=True,  key="build_skip_rnd")
 
         run_build = st.button(
             "🔨 Run Build",
-            use_container_width=True,
+            width="stretch",
             type="primary",
-            disabled=(n_img == 0),
+            disabled=(n_img == 0 and n_vid == 0),
         )
 
     if run_build:
@@ -330,9 +391,11 @@ if build_info and "project" not in st.session_state:
         ]
         if build_debug:
             cmd.append("--debug")
+        if build_videos:
+            cmd.append("--include-videos")
         if build_skip_rnd:
             cmd.append("--skip-render")
-        elif build_aln_only:
+        else:
             cmd.append("--aligned-only")
 
         total = build_info["n_images"]
@@ -361,21 +424,33 @@ if build_info and "project" not in st.session_state:
         )
 
         # ── Parsing state ──────────────────────────────────────────────────
-        pass_num   = 1
-        done       = 0           # frames processed in current pass
-        p1_ok      = 0
-        p1_fail    = 0
-        p2_ok      = 0
+        pass_num    = 1
+        done        = 0           # frames processed in current pass
+        p1_ok       = 0
+        p1_fail     = 0
+        p2_ok       = 0
         p2_fallback = 0
+        # video-specific counters
+        v_total     = 0           # total videos to process (from Pass 1b header)
+        v_done      = 0           # videos processed so far
+        v_ok        = 0           # videos with a found best frame
+        v_skip      = 0           # videos skipped (no valid candidate)
+        v_candidates= 0           # candidate frames sampled for current video
         raw_lines: list[str] = []
 
         # Patterns emitted by cli.py
-        _re_frame  = _re.compile(r"\[\s*(\d+)/\s*(\d+)\]")
-        _re_p1_ok  = _re.compile(r"\bOK\b.*w=")
-        _re_p1_fail= _re.compile(r"\bFAIL\b")
-        _re_p2_ok  = _re.compile(r"\bOK\b.*rot=")
-        _re_p2_fb  = _re.compile(r"\bFALLBACK\b")
-        _re_pass2  = _re.compile(r"Pass 2")
+        _re_frame       = _re.compile(r"\[\s*(\d+)/\s*(\d+)\]")
+        _re_p1_ok       = _re.compile(r"\bOK\b.*w=")
+        _re_p1_fail     = _re.compile(r"\bFAIL\b")
+        _re_p2_ok       = _re.compile(r"\bOK\b.*rot=")
+        _re_p2_fb       = _re.compile(r"\bFALLBACK\b")
+        _re_pass2       = _re.compile(r"^Pass 2\b")
+        _re_pass1b      = _re.compile(r"^Pass 1b")
+        _re_pass2b      = _re.compile(r"^Pass 2b")
+        _re_v_total     = _re.compile(r"extracting best frames from (\d+) video")
+        _re_v_candidates= _re.compile(r"(\d+) candidate frame")
+        _re_v_best      = _re.compile(r"→ best ts=")
+        _re_v_skip      = _re.compile(r"no valid candidate")
 
         assert proc.stdout is not None
         for raw in proc.stdout:
@@ -385,46 +460,114 @@ if build_info and "project" not in st.session_state:
             line = raw.rstrip()
             m = _re_frame.search(line)
 
-            if _re_pass2.search(line):
+            # ── Phase transitions ──────────────────────────────────────────
+            if _re_pass1b.search(line):
+                pass_num = "1b"
+                v_done = 0
+                mt = _re_v_total.search(line)
+                if mt:
+                    v_total = int(mt.group(1))
+                phase_ph.markdown(f"**Phase 1b — Extracting best frames from {v_total} video(s)…**")
+                prog_ph.progress(0.0)
+                continue
+
+            if _re_pass2.search(line) and not _re_pass2b.search(line):
                 pass_num = 2
                 done = 0
-                phase_ph.markdown("**Phase 2 — Aligning and saving frames…**")
+                phase_ph.markdown("**Phase 2 — Aligning and saving photo frames…**")
                 prog_ph.progress(0.0)
+                continue
 
-            if m:
-                done   = int(m.group(1))
-                total_ = int(m.group(2))
+            if _re_pass2b.search(line):
+                pass_num = "2b"
+                v_done = 0
+                phase_ph.markdown("**Phase 2b — Aligning video best frames…**")
+                prog_ph.progress(0.0)
+                continue
 
-                # classify the outcome on the same line
-                if pass_num == 1:
-                    if _re_p1_ok.search(line):
-                        p1_ok += 1
-                    elif _re_p1_fail.search(line):
-                        p1_fail += 1
+            # ── Per-line parsing ───────────────────────────────────────────
+            if pass_num in ("1b", "2b"):
+                # Video frame counter [vi/total]
+                if m:
+                    v_done      = int(m.group(1))
+                    v_total_now = int(m.group(2))
+                    # Phase 1b: v_total_now == number of videos → safe to use directly
+                    # Phase 2b: v_total_now == global item count (photos+videos),
+                    #           so always use the line's own denominator to avoid >1.0
+                    progress_denom = v_total_now if v_total_now else 1
+                    if pass_num == "1b" and v_total == 0:
+                        v_total = v_total_now
+                    v_candidates = 0   # reset for new video
+                    prog_ph.progress(min(v_done / progress_denom, 1.0))
+                    fname = line.split("]", 1)[-1].strip().split("…")[0].strip()
+                    if fname:
+                        file_ph.caption(f"Processing: `{fname}`")
+
+                elif _re_v_candidates.search(line):
+                    mc = _re_v_candidates.search(line)
+                    if mc:
+                        v_candidates = int(mc.group(1))
+                    if v_total:
+                        pct = (v_done - 1 + 0.5) / v_total   # halfway through current video
+                        prog_ph.progress(min(pct, 1.0))
+                    file_ph.caption(f"Scoring {v_candidates} candidate frames…")
+
+                elif _re_v_best.search(line):
+                    v_ok += 1
+                    ts_part = line.strip().lstrip("→ ").split("score=")
+                    detail = line.strip().lstrip("→ ")
+                    file_ph.caption(f"✅ {detail}")
+
+                elif _re_v_skip.search(line):
+                    v_skip += 1
+                    file_ph.caption("⚠️ No valid candidate found — skipping")
+
+                if pass_num == "1b":
+                    stats_ph.markdown(
+                        f"**Phase 1** — ✅ {p1_ok} detected &nbsp; ⚠️ {p1_fail} failed &nbsp;&nbsp;|&nbsp;&nbsp; "
+                        f"**Phase 1b (videos)** — 🎬 {v_done}/{v_total} &nbsp; ✅ best found: **{v_ok}** &nbsp; ⏭ skipped: **{v_skip}**"
+                    )
                 else:
-                    if _re_p2_ok.search(line):
-                        p2_ok += 1
-                    elif _re_p2_fb.search(line):
-                        p2_fallback += 1
+                    stats_ph.markdown(
+                        f"**Phase 1** — ✅ {p1_ok} / ⚠️ {p1_fail} &nbsp;&nbsp;|&nbsp;&nbsp; "
+                        f"**Phase 2** — ✅ {p2_ok} / 🔄 {p2_fallback} &nbsp;&nbsp;|&nbsp;&nbsp; "
+                        f"**Phase 2b (videos)** — 🎬 {v_done}/{v_total} aligned"
+                    )
 
-                prog_ph.progress(done / total_ if total_ else 0.0)
-
-                fname = line.split("]", 1)[-1].strip().split("…")[0].strip() if "]" in line else ""
-                file_ph.caption(f"Processing: `{fname}`")
-
-            # Update stats block on every line
-            if pass_num == 1:
-                stats_ph.markdown(
-                    f"**Phase 1** — "
-                    f"✅ Detected: **{p1_ok}** &nbsp;&nbsp; "
-                    f"⚠️ Failed: **{p1_fail}** &nbsp;&nbsp; "
-                    f"📸 Total: **{total}**"
-                )
             else:
-                stats_ph.markdown(
-                    f"**Phase 1** — ✅ {p1_ok} detected &nbsp; ⚠️ {p1_fail} failed &nbsp;&nbsp;|&nbsp;&nbsp; "
-                    f"**Phase 2** — ✅ Aligned: **{p2_ok}** &nbsp; 🔄 Fallback: **{p2_fallback}**"
-                )
+                # Photo phases (1 and 2)
+                if m:
+                    done   = int(m.group(1))
+                    total_ = int(m.group(2))
+
+                    if pass_num == 1:
+                        if _re_p1_ok.search(line):
+                            p1_ok += 1
+                        elif _re_p1_fail.search(line):
+                            p1_fail += 1
+                    else:
+                        if _re_p2_ok.search(line):
+                            p2_ok += 1
+                        elif _re_p2_fb.search(line):
+                            p2_fallback += 1
+
+                    prog_ph.progress(done / total_ if total_ else 0.0)
+
+                    fname = line.split("]", 1)[-1].strip().split("…")[0].strip() if "]" in line else ""
+                    file_ph.caption(f"Processing: `{fname}`")
+
+                if pass_num == 1:
+                    stats_ph.markdown(
+                        f"**Phase 1** — "
+                        f"✅ Detected: **{p1_ok}** &nbsp;&nbsp; "
+                        f"⚠️ Failed: **{p1_fail}** &nbsp;&nbsp; "
+                        f"📸 Total: **{total}**"
+                    )
+                else:
+                    stats_ph.markdown(
+                        f"**Phase 1** — ✅ {p1_ok} detected &nbsp; ⚠️ {p1_fail} failed &nbsp;&nbsp;|&nbsp;&nbsp; "
+                        f"**Phase 2** — ✅ Aligned: **{p2_ok}** &nbsp; 🔄 Fallback: **{p2_fallback}**"
+                    )
 
         proc.wait()
         file_ph.empty()
@@ -432,10 +575,15 @@ if build_info and "project" not in st.session_state:
         if proc.returncode == 0:
             prog_ph.progress(1.0)
             phase_ph.empty()
+            video_summary = (
+                f" &nbsp;&nbsp;|&nbsp;&nbsp; Videos: 🎬 {v_ok} extracted / ⏭ {v_skip} skipped"
+                if v_total > 0 else ""
+            )
             stats_ph.markdown(
                 f"**Done!** &nbsp;&nbsp; "
                 f"Phase 1: ✅ {p1_ok} detected / ⚠️ {p1_fail} failed &nbsp;&nbsp;|&nbsp;&nbsp; "
                 f"Phase 2: ✅ {p2_ok} aligned / 🔄 {p2_fallback} fallback"
+                f"{video_summary}"
             )
             st.success("Build complete — loading project…")
             proj_json = Path(build_info["output"]) / "project.json"
@@ -454,13 +602,15 @@ if build_info and "project" not in st.session_state:
 if "project" not in st.session_state:
     st.markdown("## Welcome to Fitness Progress")
     st.markdown(
+        "Turn a mixed folder of **photos and videos** into a smooth, body-aligned progress slideshow.\n\n"
         "Use the sidebar to get started:\n\n"
-        "1. Enter your **input photos folder** path.\n"
+        "1. Enter your **input folder** path (photos, videos, or both).\n"
         "2. The output folder is auto-derived (or override it).\n"
         "3. Click **Open / Load Project**.\n"
         "   - If a project already exists it will load immediately.\n"
         "   - Otherwise a **Build** panel will appear to run the pipeline.\n\n"
-        "After loading, you can review frames, correct alignment, and render videos."
+        "Videos (.mp4 / .mov / .m4v) are processed alongside photos — the pipeline\n"
+        "automatically picks the best frame from each clip."
     )
     st.stop()
 
@@ -495,7 +645,6 @@ with st.sidebar:
         value=float(settings.get("frame_duration_seconds", 0.8)),
         help="How long each photo is held. Overrides the value in project.json.",
     )
-    render_aligned_only       = st.toggle("Aligned only (skip original)", value=True)
     render_with_comparison    = st.toggle("Include comparison video",      value=False)
     render_include_unreviewed = st.toggle(
         "Include unreviewed frames", value=False,
@@ -504,7 +653,7 @@ with st.sidebar:
     render_transition  = st.selectbox("Transition", ["crossfade", "hard_cut"], index=0)
     render_date_labels = st.toggle("Date labels", value=True)
 
-    do_render = st.button("🎬 Render", use_container_width=True, type="primary")
+    do_render = st.button("🎬 Render", width="stretch", type="primary")
 
 if do_render:
     proj_path  = Path(st.session_state.project_path)
@@ -517,8 +666,6 @@ if do_render:
         skip_unreviewed         = not render_include_unreviewed,
     )
     jobs: list[tuple[str, object]] = [("progress_aligned.mp4", render_aligned)]
-    if not render_aligned_only:
-        jobs.append(("progress_original.mp4", render_original))
     if render_with_comparison:
         jobs.append(("progress_comparison.mp4", render_comparison))
 
@@ -560,6 +707,60 @@ if idx not in visible:
 
 pos = visible.index(idx)
 
+# ── Grid navigator ─────────────────────────────────────────────────────────
+
+_GRID_COLS = 6
+
+with st.expander("📋 Browse frames", expanded=True):
+    st.markdown(
+        "<style>"
+        "  div[data-testid='stExpander'] div[data-testid='stHorizontalBlock'] {"
+        "    gap: 4px !important;"
+        "  }"
+        "  div[data-testid='stExpander'] .stImage img {"
+        "    border-radius: 4px;"
+        "  }"
+        "</style>",
+        unsafe_allow_html=True,
+    )
+    for row_start in range(0, len(visible), _GRID_COLS):
+        row_idxs = visible[row_start : row_start + _GRID_COLS]
+        cols = st.columns(_GRID_COLS)
+        for col_slot, vi in zip(cols, row_idxs):
+            with col_slot:
+                it       = items[vi]
+                thumb    = _load_grid_thumb(it["outputs"]["aligned_frame"])
+                is_sel   = (vi == idx)
+                approved = it["status"] == "approved"
+                icon     = "✅" if approved else "🔶"
+                cap_date = it.get("capture_date", "")
+                date_str = cap_date[:10] if cap_date else ""
+                label    = f"{icon} {it['id']}"
+                if thumb:
+                    st.image(thumb, width="stretch")
+                sel_col, tog_col = st.columns([3, 1])
+                with sel_col:
+                    st.button(
+                        label,
+                        key=f"grid_{vi}",
+                        width="stretch",
+                        type="primary" if is_sel else "secondary",
+                        help=f"{Path(it['source_path']).name}" + (f"\n{date_str}" if date_str else ""),
+                        on_click=_select_frame,
+                        args=(vi,),
+                    )
+                with tog_col:
+                    st.button(
+                        "✅" if approved else "🔶",
+                        key=f"grid_toggle_{vi}",
+                        width="stretch",
+                        help="Approved — click to flag" if approved else "Needs review — click to approve",
+                        on_click=_toggle_status,
+                        args=(vi,),
+                    )
+
+st.divider()
+
 # ── Layout ─────────────────────────────────────────────────────────────────
 
 img_col, ctrl_col = st.columns([1, 1], gap="large")
@@ -574,6 +775,158 @@ with ctrl_col:
     k_rot, k_scale, k_tx, k_ty = _slider_keys(iid)
 
     st.subheader(f"[{iid}] {Path(item['source_path']).name}")
+
+    # ── Video-frame info panel (shown only for video_frame items) ───────
+    is_video_frame = item.get("media_type") == "video_frame"
+    if is_video_frame:
+        vsel = item.get("video_selection", {})
+        ts_stored = float(vsel.get("timestamp_seconds") or 0.0)
+        vscore    = vsel.get("score")
+        vreason   = vsel.get("reason", "")
+
+        # Define vpath first so all subsequent checks can use it
+        vpath = Path(item["source_path"])
+
+        st.info(
+            f"📹 **Video frame** — source: `{vpath.name}`  \n"
+            f"Auto-selected timestamp: **{ts_stored:.2f}s**  \n"
+            + (f"Score: **{vscore:.2f}**  \n" if vscore is not None else "")
+            + (f"Reason: {vreason}" if vreason else "")
+        )
+
+        # Show HDR / rotation badges
+        _vinfo_cache: dict = {}
+        if vpath.exists():
+            try:
+                from progress_aligner.video_sampling import get_video_info as _gvi2
+                _vi2 = _gvi2(vpath)
+                _vinfo_cache = {"is_hdr": _vi2.is_hdr, "hdr_transfer": _vi2.hdr_transfer,
+                                "rotation": _vi2.rotation_degrees, "duration": _vi2.duration_seconds}
+                if _vi2.is_hdr:
+                    st.caption(f"⚡ HDR video ({_vi2.hdr_transfer}) — tone-mapping applied automatically")
+                if _vi2.rotation_degrees:
+                    st.caption(f"↻ Auto-rotated {_vi2.rotation_degrees}°")
+            except Exception:
+                pass
+
+        # Timestamp slider — lets reviewer pick a different moment
+        vdur = float(_vinfo_cache.get("duration", 0.0))
+
+        ts_key = f"video_ts_{iid}"
+        if ts_key not in st.session_state:
+            st.session_state[ts_key] = ts_stored
+
+        if vdur > 0:
+            new_ts = st.slider(
+                "Timestamp (s)",
+                min_value=0.0,
+                max_value=round(vdur, 2),
+                step=0.05,
+                key=ts_key,
+            )
+            if st.button("🔄 Extract frame at this timestamp", width="stretch"):
+                if vpath.exists():
+                    try:
+                        from progress_aligner.video_sampling import (
+                            _read_rotation, _rotate_frame,
+                            _probe_hdr, _hdr_heuristic, _tonemap_sdr,
+                        )
+                        _cap2 = cv2.VideoCapture(str(vpath))
+                        if not _cap2.isOpened():
+                            st.error("Could not open video file.")
+                            _cap2.release()
+                            raise RuntimeError("VideoCapture.isOpened() is False")
+                        _rotation = _read_rotation(_cap2)
+                        _is_hdr, _hdr_tag = _probe_hdr(vpath)
+                        # Clamp slightly away from the very end to avoid
+                        # seeking past EOF, then retry once if the first
+                        # read fails (AVFoundation backend sometimes needs a
+                        # second attempt after a seek).
+                        _seek_ts = min(new_ts, max(0.0, vdur - 0.1))
+                        _cap2.set(cv2.CAP_PROP_POS_MSEC, _seek_ts * 1000.0)
+                        _ret, _bgr = _cap2.read()
+                        if not _ret:
+                            # One retry at the same position
+                            _cap2.set(cv2.CAP_PROP_POS_MSEC, _seek_ts * 1000.0)
+                            _ret, _bgr = _cap2.read()
+                        _cap2.release()
+                        if _ret:
+                            _bgr = _rotate_frame(_bgr, _rotation)
+                            # Use only the luminance heuristic, not the ffprobe
+                            # flag — platform decoders may already have applied
+                            # the HDR→SDR conversion, making a second tone-map
+                            # unnecessary and colour-distorting.
+                            if _hdr_heuristic(_bgr):
+                                _bgr = _tonemap_sdr(_bgr)
+                                _hdr_tag = _hdr_tag or "heuristic"
+                            # Convert to RGB and run shoulder detection + alignment
+                            _rgb = cv2.cvtColor(_bgr, cv2.COLOR_BGR2RGB)
+                            _settings = proj.get("settings", {})
+                            _cfg = Config(
+                                output_width=_settings.get("output_width", 1080),
+                                output_height=_settings.get("output_height", 1920),
+                                target_shoulder_midpoint_x=_settings.get("target_shoulder_midpoint", [540, 620])[0],
+                                target_shoulder_midpoint_y=_settings.get("target_shoulder_midpoint", [540, 620])[1],
+                                max_rotation_degrees=_settings.get("max_rotation_degrees", 8.0),
+                                min_scale=_settings.get("min_scale", 0.75),
+                                max_scale=_settings.get("max_scale", 1.35),
+                            )
+                            _eff_w = float(_settings.get("target_shoulder_width_used") or 0.0)
+                            _pose_model = _get_pose_model()
+                            _detection = detect_shoulders(_rgb, _pose_model, _cfg)
+                            _transform = None
+                            _affine_M  = None
+                            if _detection.detected and _eff_w > 0:
+                                _transform = compute_transform(_detection, _cfg, _eff_w)
+                                _affine_M  = build_affine_matrix(
+                                    midpoint=_detection.midpoint_px,
+                                    rotation_degrees=_transform.rotation_degrees,
+                                    scale=_transform.scale,
+                                    translate_x=_transform.translate_x,
+                                    translate_y=_transform.translate_y,
+                                )
+                                _aligned_rgb = apply_affine(_rgb, _affine_M, _cfg.output_width, _cfg.output_height)
+                                _status_note = f"OK  rot={_transform.rotation_degrees:.2f}°  scale={_transform.scale:.3f}"
+                            else:
+                                _aligned_rgb = center_crop_to_canvas(_rgb, _cfg.output_width, _cfg.output_height)
+                                _status_note = f"FALLBACK ({_detection.fail_reason})"
+
+                            # Save properly aligned frame
+                            _out = Path(item["outputs"]["aligned_frame"])
+                            _out.parent.mkdir(parents=True, exist_ok=True)
+                            cv2.imwrite(str(_out), cv2.cvtColor(_aligned_rgb, cv2.COLOR_RGB2BGR))
+                            _load_aligned_bgr.clear()
+
+                            # Update project.json: timestamp, pose, transform
+                            item["video_selection"]["timestamp_seconds"] = new_ts
+                            item["pose"] = {
+                                "detected": _detection.detected,
+                                "fail_reason": _detection.fail_reason if not _detection.detected else "",
+                                "shoulder_width_px": round(float(_detection.shoulder_width_px), 2) if _detection.detected else 0.0,
+                                "shoulder_angle_degrees": round(float(_detection.angle_degrees), 4) if _detection.detected else 0.0,
+                                "shoulder_midpoint": list(_detection.midpoint_px) if _detection.detected else [0, 0],
+                                "left_visibility": round(float(_detection.left_visibility), 4),
+                                "right_visibility": round(float(_detection.right_visibility), 4),
+                            }
+                            item["auto_transform"] = {
+                                "rotation_degrees": _transform.rotation_degrees if _transform else 0.0,
+                                "scale": _transform.scale if _transform else 1.0,
+                                "translate_x": _transform.translate_x if _transform else 0.0,
+                                "translate_y": _transform.translate_y if _transform else 0.0,
+                                "clamped_rotation": _transform.clamped_rotation if _transform else False,
+                                "clamped_scale": _transform.clamped_scale if _transform else False,
+                            }
+                            _save_project(proj, st.session_state.project_path)
+                            _note = f", HDR tone-mapped ({_hdr_tag})" if _hdr_tag else ""
+                            st.success(f"Extracted {new_ts:.2f}s (rot {_rotation}°{_note}) — alignment: {_status_note}")
+                        else:
+                            st.error("Could not read frame at that timestamp.")
+                    except Exception as exc:
+                        st.error(f"Error extracting frame: {exc}")
+                else:
+                    st.warning("Source video not found on disk.")
+        st.divider()
+    # ── end video-frame info ───────────────────────────────────────────
 
     status_color = "green" if item["status"] == "approved" else "orange"
     st.markdown(
@@ -618,12 +971,12 @@ with ctrl_col:
     btn_col1, btn_col2 = st.columns(2)
 
     with btn_col1:
-        if st.button("↺ Reset sliders", use_container_width=True):
+        if st.button("↺ Reset sliders", width="stretch"):
             _reset_sliders_for(item)
             st.rerun()
 
     with btn_col2:
-        save_clicked = st.button("💾 Save & Regenerate", use_container_width=True, type="primary")
+        save_clicked = st.button("💾 Save & Regenerate", width="stretch", type="primary")
 
     if save_clicked:
         item["manual_adjustment"] = current_manual
@@ -638,12 +991,12 @@ with ctrl_col:
     st.divider()
 
     if item["status"] == "approved":
-        if st.button("⚠ Mark as Needs Review", use_container_width=True):
+        if st.button("⚠ Mark as Needs Review", width="stretch"):
             item["status"] = "needs_manual_review"
             _save_project(proj, st.session_state.project_path)
             st.rerun()
     else:
-        if st.button("✓ Mark as Approved", use_container_width=True):
+        if st.button("✓ Mark as Approved", width="stretch"):
             item["status"] = "approved"
             _save_project(proj, st.session_state.project_path)
             st.rerun()
@@ -656,7 +1009,7 @@ with ctrl_col:
 with img_col:
     nav1, nav2, nav3 = st.columns([1, 3, 1])
     with nav1:
-        if st.button("◀ Prev", use_container_width=True, disabled=(pos == 0)):
+        if st.button("◀ Prev", width="stretch", disabled=(pos == 0)):
             st.session_state.idx = visible[pos - 1]
             st.rerun()
     with nav2:
@@ -666,7 +1019,7 @@ with img_col:
             unsafe_allow_html=True,
         )
     with nav3:
-        if st.button("Next ▶", use_container_width=True, disabled=(pos == len(visible) - 1)):
+        if st.button("Next ▶", width="stretch", disabled=(pos == len(visible) - 1)):
             st.session_state.idx = visible[pos + 1]
             st.rerun()
 
@@ -686,7 +1039,7 @@ with img_col:
             if prev_bgr is not None:
                 preview_bgr = _blend(preview_bgr, prev_bgr, OVERLAY_ALPHA)
 
-        st.image(_thumbnail(preview_bgr), use_container_width=True)
+        st.image(_thumbnail(preview_bgr), width="stretch")
 
     cap = item.get("capture_date")
     if cap:

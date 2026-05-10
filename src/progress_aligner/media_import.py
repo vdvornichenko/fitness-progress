@@ -1,5 +1,5 @@
 """
-Image discovery and chronological sorting.
+Image and video discovery with chronological sorting.
 
 Sort priority:
   1. EXIF DateTimeOriginal / DateTimeDigitized / DateTime
@@ -16,6 +16,7 @@ from typing import Optional
 from PIL import Image
 
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png"})
+VIDEO_EXTENSIONS: frozenset[str] = frozenset({".mp4", ".mov", ".m4v"})
 
 # EXIF tag IDs
 _TAG_DATETIME_ORIGINAL  = 36867
@@ -83,3 +84,18 @@ def collect_images(folder: Path) -> list[Path]:
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
     ]
     return sorted(images, key=_sort_key)
+
+
+def collect_videos(folder: Path, extensions: Optional[frozenset[str]] = None) -> list[Path]:
+    """Return all supported video files in folder, sorted chronologically."""
+    exts = extensions if extensions is not None else VIDEO_EXTENSIONS
+    videos = [
+        p for p in folder.iterdir()
+        if p.is_file() and p.suffix.lower() in exts
+    ]
+    return sorted(videos, key=_sort_key)
+
+
+def get_video_capture_date(path: Path) -> Optional[datetime]:
+    """Best-effort capture date for a video: filename pattern > mtime."""
+    return get_filename_date(path) or datetime.fromtimestamp(path.stat().st_mtime)

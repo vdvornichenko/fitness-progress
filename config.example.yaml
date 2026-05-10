@@ -28,3 +28,26 @@ min_margin_from_edge_px: 20
 # Video rendering (Phase 2)
 frame_duration_seconds: 0.8
 fps: 30
+
+# ── Video import / best-frame extraction ────────────────────────────────────
+video:
+  enabled: true
+  # File extensions to treat as video sources
+  extensions: [".mp4", ".mov", ".m4v"]
+
+  best_frame:
+    # How often to sample frames (seconds between samples)
+    sample_interval_seconds: 0.25
+    # Ignore this many seconds at the start and end of each video
+    avoid_start_seconds: 0.5
+    avoid_end_seconds: 0.5
+    # Minimum composite score for a frame to be accepted without manual review
+    min_score: 0.5
+
+    scoring:
+      # Weights for the composite score (should sum to ~1.0)
+      pose:       0.35   # 1.0 if shoulders detected, 0.0 otherwise
+      shoulders:  0.25   # average visibility of both shoulder landmarks
+      blur:       0.15   # Laplacian variance (sharpness)
+      centering:  0.15   # shoulder midpoint closeness to canvas centre
+      brightness: 0.10   # avoids under- and over-exposed frames

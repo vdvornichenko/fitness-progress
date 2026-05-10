@@ -30,11 +30,14 @@ import mediapipe as mp
 from .alignment import compute_transform
 from .config import Config, load_config
 from .debug_render import render_debug
-from .media_import import collect_images, get_capture_date
+from .media_import import collect_images, collect_videos, get_capture_date, get_video_capture_date
 from .pose import ShoulderDetection, detect_shoulders, load_rgb
 from .project_store import build_item, save_project
 from .transforms import apply_affine, build_affine_matrix, center_crop_to_canvas
 from .video_render import render_aligned, render_comparison, render_original
+from .video_moment_picker import pick_best_frame, PickedMoment
+from .video_sampling import get_video_info, sample_frames
+from .video_scoring import score_frames
 
 
 def cmd_build(args: argparse.Namespace) -> None:
@@ -48,21 +51,38 @@ def cmd_build(args: argparse.Namespace) -> None:
     config_path = Path(args.config).resolve() if args.config else None
     config = load_config(config_path)
 
+    # CLI overrides for video settings
+    if getattr(args, "video_sample_interval", None) is not None:
+        config.video_sample_interval = args.video_sample_interval
+    if getattr(args, "min_video_score", None) is not None:
+        config.video_min_score = args.min_video_score
+
     aligned_dir = output_dir / "aligned_frames"
     debug_dir   = output_dir / "debug"
+    video_candidates_dir = output_dir / "video_candidates"
     aligned_dir.mkdir(parents=True, exist_ok=True)
     debug_dir.mkdir(parents=True, exist_ok=True)
 
+    include_videos = getattr(args, "include_videos", False)
+    if include_videos:
+        video_candidates_dir.mkdir(parents=True, exist_ok=True)
+
     images = collect_images(input_dir)
-    if not images:
-        print("No JPG/PNG images found in input folder.", file=sys.stderr)
+    videos: list[Path] = []
+    if include_videos and config.video_enabled:
+        from .media_import import VIDEO_EXTENSIONS
+        exts = frozenset(config.video_extensions) if config.video_extensions else VIDEO_EXTENSIONS
+        videos = collect_videos(input_dir, extensions=exts)
+
+    if not images and not videos:
+        print("No JPG/PNG images or supported videos found in input folder.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Found {len(images)} image(s)  →  output: {output_dir}")
+    print(f"Found {len(images)} image(s) and {len(videos)} video(s)  \u2192  output: {output_dir}")
     print()
 
-    # ── Pass 1: shoulder detection ─────────────────────────────────────────
-    print("Pass 1 — detecting shoulders …")
+    # ── Pass 1: shoulder detection on photos ─────────────────────────────────
+    print("Pass 1 — detecting shoulders in photos…")
     detections:    list[ShoulderDetection] = []
     capture_dates: list[datetime | None]   = []
 
@@ -91,7 +111,75 @@ def cmd_build(args: argparse.Namespace) -> None:
                 print(f"OK  (w={det.shoulder_width_px:.0f}px  tilt={det.angle_degrees:.1f}°)")
             else:
                 print(f"FAIL ({det.fail_reason})")
+    # ── Pass 1b: video moment selection ───────────────────────────────────────
+    picked_moments: list[PickedMoment] = []
 
+    if videos:
+        print()
+        print(f"Pass 1b — extracting best frames from {len(videos)} video(s)…")
+        with mp.solutions.pose.Pose(
+            static_image_mode=True,
+            model_complexity=2,
+            enable_segmentation=False,
+            min_detection_confidence=0.3,
+        ) as vm:
+            for vi, vpath in enumerate(videos, 1):
+                print(f"  [{vi:>3}/{len(videos)}] {vpath.name}", flush=True)
+                try:
+                    info = get_video_info(vpath)
+                    rotation_label = (
+                        f"  rotation={info.rotation_degrees}°" if info.rotation_degrees else ""
+                    )
+                    hdr_label = f"  HDR({info.hdr_transfer})" if info.is_hdr else ""
+                    print(
+                        f"         duration={info.duration_seconds:.1f}s  "
+                        f"fps={info.fps:.0f}  {info.width}x{info.height}"
+                        f"{rotation_label}{hdr_label}",
+                        flush=True,
+                    )
+                    n_expected = max(1, int(
+                        (max(0.0, info.duration_seconds
+                             - config.video_avoid_start_seconds
+                             - config.video_avoid_end_seconds)
+                         ) / config.video_sample_interval
+                    ))
+                    print(f"         Sampling ~{n_expected} frame(s)…", flush=True)
+                    candidates = sample_frames(
+                        vpath,
+                        interval_seconds=config.video_sample_interval,
+                        avoid_start=config.video_avoid_start_seconds,
+                        avoid_end=config.video_avoid_end_seconds,
+                    )
+                    print(f"         {len(candidates)} candidate frame(s) sampled", flush=True)
+                    scored = score_frames(candidates, vm, config)
+                    moment = pick_best_frame(scored, vpath, config)
+                    if moment:
+                        picked_moments.append(moment)
+                        status = (
+                            f"best ts={moment.timestamp_seconds:.2f}s  "
+                            f"score={moment.score:.2f}"
+                        )
+                        print(f"         → {status}", flush=True)
+
+                        # Save best candidate frame to video_candidates/ for inspection
+                        cand_path = video_candidates_dir / f"{vpath.stem}_best.jpg"
+                        import cv2 as _cv2
+                        _cv2.imwrite(
+                            str(cand_path),
+                            _cv2.cvtColor(moment.scored_frame.candidate.rgb, _cv2.COLOR_RGB2BGR),
+                            [_cv2.IMWRITE_JPEG_QUALITY, 90],
+                        )
+                    else:
+                        print("         → no valid candidate found — skipping", flush=True)
+                except Exception as exc:
+                    print(f"         ERROR: {exc}", file=sys.stderr, flush=True)
+
+    # ── Merge photo detections + video moments for width calibration ───────────
+    # (video shoulder widths feed the same median calculation)
+    all_widths = [d.shoulder_width_px for d in detections if d.detected]
+    for pm in picked_moments:
+        if pm.scored_frame.detection.detected:
+            all_widths.append(pm.scored_frame.detection.shoulder_width_px)
     # ── Compute effective target shoulder width ────────────────────────────
     valid_widths = [d.shoulder_width_px for d in detections if d.detected]
 
@@ -110,12 +198,15 @@ def cmd_build(args: argparse.Namespace) -> None:
 
     n_ok = sum(1 for d in detections if d.detected)
     print()
-    print(f"  Detection : {n_ok}/{len(images)} ({100 * n_ok / len(images):.1f}%)")
+    print(f"  Photos    : {n_ok}/{len(images)} detected ({100 * n_ok / len(images):.1f}%)" if images else "  Photos    : 0")
+    if videos:
+        v_ok = sum(1 for pm in picked_moments if pm.scored_frame.detection.detected)
+        print(f"  Videos    : {v_ok}/{len(videos)} with detected shoulders")
     print(f"  Target w  : {width_source}")
     print()
 
-    # ── Pass 2: align, render, save ────────────────────────────────────────
-    print("Pass 2 — aligning and saving frames …")
+    # ── Pass 2: align photos ───────────────────────────────────────────────────
+    print("Pass 2 — aligning and saving frames…")
     project_items: list[dict] = []
     created_at = datetime.now()
 
@@ -184,7 +275,64 @@ def cmd_build(args: argparse.Namespace) -> None:
             capture_date = cap_date,
             detection    = detection,
             transform    = transform,
+            media_type   = "photo",
         ))
+
+    # ── Pass 2b: align video best frames ──────────────────────────────────────
+    if picked_moments:
+        print()
+        print(f"Pass 2b — aligning {len(picked_moments)} video best frame(s)…", flush=True)
+        base_index = len(images) + 1
+        for vi, moment in enumerate(picked_moments, base_index):
+            vpath = moment.source_path
+            print(f"  [{vi:>3}/{base_index + len(picked_moments) - 1}] {vpath.name} @ {moment.timestamp_seconds:.2f}s …", end=" ", flush=True)
+
+            detection = moment.scored_frame.detection
+            rgb       = moment.scored_frame.candidate.rgb
+            transform = None
+            affine_M  = None
+
+            if detection.detected:
+                transform = compute_transform(detection, config, effective_target_width)
+                affine_M  = build_affine_matrix(
+                    midpoint         = detection.midpoint_px,
+                    rotation_degrees = transform.rotation_degrees,
+                    scale            = transform.scale,
+                    translate_x      = transform.translate_x,
+                    translate_y      = transform.translate_y,
+                )
+                aligned_rgb = apply_affine(rgb, affine_M, config.output_width, config.output_height)
+                print(f"OK  rot={transform.rotation_degrees:.2f}°  scale={transform.scale:.3f}", flush=True)
+            else:
+                aligned_rgb = center_crop_to_canvas(rgb, config.output_width, config.output_height)
+                print(f"FALLBACK ({detection.fail_reason})", flush=True)
+
+            idx          = f"{vi:04d}"
+            aligned_path = aligned_dir / f"{idx}.png"
+            cv2.imwrite(str(aligned_path), cv2.cvtColor(aligned_rgb, cv2.COLOR_RGB2BGR))
+
+            if args.debug and affine_M is not None:
+                debug_path = debug_dir / f"{idx}_debug.jpg"
+                debug_bgr = render_debug(
+                    aligned_rgb=aligned_rgb, detection=detection, transform=transform,
+                    affine_matrix=affine_M, config=config,
+                    source_filename=vpath.name, index=vi,
+                )
+                cv2.imwrite(str(debug_path), debug_bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
+
+            cap_date = get_video_capture_date(vpath)
+            project_items.append(build_item(
+                index                  = vi,
+                source_path            = vpath,
+                output_base            = output_dir,
+                capture_date           = cap_date,
+                detection              = detection,
+                transform              = transform,
+                media_type             = "video_frame",
+                video_timestamp_seconds= moment.timestamp_seconds,
+                video_score            = moment.score,
+                video_score_reason     = moment.reason,
+            ))
 
     # ── Save project.json ──────────────────────────────────────────────────
     project_json = output_dir / "project.json"
@@ -417,6 +565,18 @@ def main() -> None:
     build_p.add_argument(
         "--debug", action="store_true",
         help="Save debug overlay frames to the debug/ subfolder.",
+    )
+    build_p.add_argument(
+        "--include-videos", action="store_true",
+        help="Also import .mp4/.mov/.m4v files and extract the best still frame.",
+    )
+    build_p.add_argument(
+        "--video-sample-interval", type=float, default=None, metavar="SEC",
+        help="Seconds between sampled video frames (overrides config).",
+    )
+    build_p.add_argument(
+        "--min-video-score", type=float, default=None, metavar="SCORE",
+        help="Minimum composite score for a video frame to be accepted (overrides config).",
     )
     _add_render_args(build_p)
 
