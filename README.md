@@ -30,7 +30,7 @@ and lets you review and manually correct each frame in a Streamlit UI before ren
 
 ```bash
 # 1. Clone
-git clone https://github.com/<your-username>/fitness-progress.git
+git clone https://github.com/vdvornichenko/fitness-progress.git
 cd fitness-progress
 
 # 2. Create and activate a virtual environment
