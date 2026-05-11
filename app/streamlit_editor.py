@@ -852,11 +852,18 @@ with ctrl_col:
                         _cap2.release()
                         if _ret:
                             _bgr = _rotate_frame(_bgr, _rotation)
-                            # Use only the luminance heuristic, not the ffprobe
-                            # flag — platform decoders may already have applied
-                            # the HDR→SDR conversion, making a second tone-map
-                            # unnecessary and colour-distorting.
-                            if _hdr_heuristic(_bgr):
+                            # Two-tier HDR detection — same logic as sample_frames():
+                            # lower threshold when ffprobe confirmed HDR (catches
+                            # bad VideoToolbox decodes), high threshold otherwise.
+                            from progress_aligner.video_sampling import (
+                                _HDR_LUMINANCE_THRESHOLD_CONFIRMED,
+                                _HDR_LUMINANCE_THRESHOLD_UNKNOWN,
+                            )
+                            _hdr_thresh = (
+                                _HDR_LUMINANCE_THRESHOLD_CONFIRMED if _is_hdr
+                                else _HDR_LUMINANCE_THRESHOLD_UNKNOWN
+                            )
+                            if _hdr_heuristic(_bgr, _hdr_thresh):
                                 _bgr = _tonemap_sdr(_bgr)
                                 _hdr_tag = _hdr_tag or "heuristic"
                             # Convert to RGB and run shoulder detection + alignment
@@ -868,8 +875,8 @@ with ctrl_col:
                                 target_shoulder_midpoint_x=_settings.get("target_shoulder_midpoint", [540, 620])[0],
                                 target_shoulder_midpoint_y=_settings.get("target_shoulder_midpoint", [540, 620])[1],
                                 max_rotation_degrees=_settings.get("max_rotation_degrees", 8.0),
-                                min_scale=_settings.get("min_scale", 0.75),
-                                max_scale=_settings.get("max_scale", 1.35),
+                                min_scale=_settings.get("min_scale", 0.35),
+                                max_scale=_settings.get("max_scale", 2.5),
                             )
                             _eff_w = float(_settings.get("target_shoulder_width_used") or 0.0)
                             _pose_model = _get_pose_model()

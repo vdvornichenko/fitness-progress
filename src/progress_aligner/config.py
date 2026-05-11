@@ -31,8 +31,12 @@ class Config:
 
     # Transform clamping
     max_rotation_degrees: float = 8.0
-    min_scale: float = 0.75
-    max_scale: float = 1.35
+    # Wide defaults so people photographed at different distances from the
+    # mirror are still normalized to the same apparent size.  The scale is
+    # set by shoulder-width detection, so even a 2× zoom-out is safe when
+    # shoulders are clearly visible.
+    min_scale: float = 0.35
+    max_scale: float = 2.5
 
     # Video rendering (Phase 2)
     frame_duration_seconds: float = 0.8

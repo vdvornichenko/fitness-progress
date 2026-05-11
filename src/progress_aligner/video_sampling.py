@@ -98,9 +98,13 @@ _HDR_TRANSFERS: frozenset[str] = frozenset({
     "hlg",            # alternate ffprobe label for HLG
 })
 
-# Heuristic: if ffprobe is absent, treat the video as HDR when the mean 8-bit
-# luminance of any sampled frame exceeds this threshold (PQ frames are pale).
-_HDR_LUMINANCE_THRESHOLD = 180.0
+# Heuristic thresholds for detecting washed-out HDR frames.
+# When ffprobe has already confirmed HDR content, we use a *low* threshold
+# so we still catch frames where VideoToolbox did a partial (bad) decode.
+# For unknown/SDR content we use a high threshold to avoid false positives
+# on legitimately bright scenes.
+_HDR_LUMINANCE_THRESHOLD_CONFIRMED = 130.0   # ffprobe said HDR
+_HDR_LUMINANCE_THRESHOLD_UNKNOWN   = 175.0   # ffprobe absent / said SDR
 
 
 def _probe_hdr(path: Path) -> tuple[bool, str]:
@@ -132,10 +136,10 @@ def _probe_hdr(path: Path) -> tuple[bool, str]:
         return False, ""
 
 
-def _hdr_heuristic(bgr: np.ndarray) -> bool:
+def _hdr_heuristic(bgr: np.ndarray, threshold: float = 175.0) -> bool:
     """Return True if the frame looks washed-out (likely PQ-encoded HDR)."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    return float(gray.mean()) > _HDR_LUMINANCE_THRESHOLD
+    return float(gray.mean()) > threshold
 
 
 def _tonemap_sdr(bgr: np.ndarray) -> np.ndarray:
@@ -240,13 +244,25 @@ def sample_frames(
 
     rotation = _read_rotation(cap)
 
-    # Determine tone-mapping need from the first decoded frame.  Even when
-    # ffprobe flags the video as HDR, platform decoders (e.g. VideoToolbox on
-    # macOS) may already apply the HDR→SDR conversion, returning frames that
-    # look perfectly normal.  Applying _tonemap_sdr on top of those produces
-    # wrong/dark colours.  The luminance heuristic is the reliable ground
-    # truth: only map if the frame actually looks washed-out (mean > 180).
-    apply_tonemap: bool = False  # set once from the first frame
+    # Determine tone-mapping need from the first decoded frame.
+    #
+    # Strategy: two-tier detection.
+    # • When ffprobe confirmed HDR, use a *lower* luminance threshold (130):
+    #   the frame is expected to be washed-out; VideoToolbox sometimes does a
+    #   correct decode (mean ~90-120, skip) and sometimes a bad one
+    #   (mean ~130-180, apply).  The lower threshold catches the bad decode
+    #   while still letting a correctly-decoded frame pass unmolested.
+    # • When the stream is unknown/SDR, use a high threshold (175) as a
+    #   safety net for mislabelled content, avoiding false positives on
+    #   bright gym lighting.
+    # • We sample the first two frames (when available) and apply tone-mapping
+    #   if either exceeds the threshold, to handle dark opening frames.
+    threshold = (
+        _HDR_LUMINANCE_THRESHOLD_CONFIRMED if is_hdr
+        else _HDR_LUMINANCE_THRESHOLD_UNKNOWN
+    )
+    apply_tonemap: bool = False  # set from the first (and optionally second) frame
+    _probe_frames_remaining: int = 2  # check up to 2 frames before locking in
 
     candidates: list[CandidateFrame] = []
     for idx, ts in enumerate(timestamps):
@@ -255,8 +271,10 @@ def sample_frames(
         if not ret:
             continue
         bgr = _rotate_frame(bgr, rotation)
-        if idx == 0:
-            apply_tonemap = _hdr_heuristic(bgr)
+        if _probe_frames_remaining > 0:
+            _probe_frames_remaining -= 1
+            if _hdr_heuristic(bgr, threshold):
+                apply_tonemap = True
         if apply_tonemap:
             bgr = _tonemap_sdr(bgr)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)

@@ -175,22 +175,32 @@ def cmd_build(args: argparse.Namespace) -> None:
                     print(f"         ERROR: {exc}", file=sys.stderr, flush=True)
 
     # ── Merge photo detections + video moments for width calibration ───────────
-    # (video shoulder widths feed the same median calculation)
-    all_widths = [d.shoulder_width_px for d in detections if d.detected]
-    for pm in picked_moments:
-        if pm.scored_frame.detection.detected:
-            all_widths.append(pm.scored_frame.detection.shoulder_width_px)
     # ── Compute effective target shoulder width ────────────────────────────
-    valid_widths = [d.shoulder_width_px for d in detections if d.detected]
+    # Photos are the stable reference baseline — they define the target body
+    # size that everything (including video frames) will be normalised to.
+    # Only fall back to video-derived widths when there are no photo
+    # detections (e.g. a video-only project).
+    photo_widths = [d.shoulder_width_px for d in detections if d.detected]
+    video_widths = [
+        pm.scored_frame.detection.shoulder_width_px
+        for pm in picked_moments
+        if pm.scored_frame.detection.detected
+    ]
 
     if config.target_shoulder_width is not None:
         effective_target_width = float(config.target_shoulder_width)
         width_source = f"config override → {effective_target_width:.1f}px"
-    elif valid_widths:
-        effective_target_width = statistics.median(valid_widths)
+    elif photo_widths:
+        effective_target_width = statistics.median(photo_widths)
         width_source = (
             f"auto-median → {effective_target_width:.1f}px"
-            f" (from {len(valid_widths)} detected images)"
+            f" (from {len(photo_widths)} photo(s) — videos normalised to this)"
+        )
+    elif video_widths:
+        effective_target_width = statistics.median(video_widths)
+        width_source = (
+            f"auto-median → {effective_target_width:.1f}px"
+            f" (from {len(video_widths)} video frame(s) — no photos available)"
         )
     else:
         effective_target_width = 420.0
