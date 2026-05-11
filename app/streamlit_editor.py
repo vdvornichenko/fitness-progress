@@ -234,7 +234,19 @@ def _auto_output(input_folder: str) -> str:
 
 def _load_project_from(proj_json: Path) -> None:
     with open(proj_json) as fh:
-        st.session_state.project = json.load(fh)
+        proj = json.load(fh)
+    # Sort items chronologically so old projects also display in date order.
+    from datetime import datetime as _dt
+    def _sort_key(it: dict):
+        cap = it.get("capture_date")
+        if cap:
+            try:
+                return _dt.fromisoformat(cap)
+            except ValueError:
+                pass
+        return _dt.max
+    proj["items"].sort(key=_sort_key)
+    st.session_state.project      = proj
     st.session_state.project_path = str(proj_json)
     st.session_state.idx = 0
 

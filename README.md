@@ -9,6 +9,10 @@ Photos and videos are treated as equally valid sources. From each video the pipe
 picks the single sharpest, best-posed frame — applying rotation correction for portrait clips and
 HDR tone-mapping for HDR10+/HLG footage — so mixed libraries work seamlessly.
 
+All items (photos and videos) are sorted into a single chronological sequence by capture date
+before the project is saved, so the final slideshow plays in the correct order regardless of
+whether dates come from EXIF tags, container metadata, or filenames.
+
 ---
 
 ## Features
@@ -20,13 +24,16 @@ HDR tone-mapping for HDR10+/HLG footage — so mixed libraries work seamlessly.
   centering, brightness); the highest-scoring frame is selected automatically.
 - **Portrait-video auto-rotation** — container rotation metadata is read and applied before any
   analysis, so clips shot in portrait mode are handled correctly.
-- **HDR10+/HLG support** — HDR footage is detected via `ffprobe` (with a luminance heuristic
-  as fallback) and tone-mapped to SDR before processing, preventing washed-out frames.
+- **HDR10+/HLG support** — HDR footage is detected via `ffprobe`. When confirmed, frames are
+  tone-mapped through a full ST 2084 PQ EOTF → BT.2020→BT.709 gamut conversion → Hable
+  tone-mapper → sRGB pipeline, producing natural colours without clipping or grey washing.
 - **Automatic alignment** — MediaPipe Pose detects shoulders in each selected frame; the frame is
   rotated, scaled, and translated so shoulders land in the same canvas spot across every item.
 - **Manual correction editor** — Streamlit UI to tweak rotation, scale, and position per frame,
   approve or flag items, and regenerate aligned PNGs on the fly. Video items show their
   auto-selected timestamp, quality score, and reason; a slider lets you re-pick any timestamp.
+- **Grid-view toggle** — approve or flag any item directly from the grid thumbnail view with a
+  single click, without opening the full detail editor.
 - **Live build progress** — a real-time progress bar tracks all four pipeline phases (photo
   detection, video extraction, photo alignment, video alignment) with per-item status.
 - **Video rendering** — exports the aligned slideshow video, an optional original-crop video, and
@@ -179,18 +186,43 @@ output/
 
 ---
 
+## Chronological ordering
+
+Photos and videos are merged into a single timeline before the project is saved:
+
+| Source | Date resolution priority |
+|--------|-------------------------|
+| Photos | EXIF `DateTimeOriginal` → filename pattern (`YYYYMMDD_HHMMSS`) → file mtime |
+| Videos | `ffprobe` container tags (`com.apple.quicktime.creationdate`, `creation_time`) → filename pattern → file mtime |
+
+All items are sorted by capture date after both processing passes complete.  The aligned
+frame files (`0001.png`, `0002.png`, …) are renamed to match the new order using a
+two-phase rename that prevents any frame from being overwritten during reordering.
+
+The Streamlit editor also re-sorts items by capture date each time a project is loaded, so
+existing projects built before this feature was added display in the correct order without
+requiring a rebuild.
+
+---
+
 ## How video processing works
 
 For each video file found in the input folder the pipeline runs four steps automatically:
 
-1. **Info** — reads duration, FPS, resolution, container rotation metadata, and checks for HDR
-   colour transfer (via `ffprobe`; falls back to a luminance heuristic if ffprobe is absent).
+1. **Info** — reads duration, FPS, resolution, container rotation metadata, and detects HDR
+   colour transfer via `ffprobe` (`color_transfer` stream tag; e.g. `smpte2084` for HDR10,
+   `arib-std-b67` for HLG).
 2. **Sampling** — decodes one frame every `video.best_frame.sample_interval_seconds`, skipping
    the first and last `avoid_*_seconds` of the clip.  Portrait clips are rotated to upright before
-   analysis; HDR frames are Reinhard tone-mapped to SDR.
+   analysis.  When `ffprobe` confirms HDR, every decoded frame is passed through the full
+   HDR-to-SDR pipeline:
+   - ST 2084 PQ EOTF — signal [0, 1] → linear light BT.2020
+   - BT.2020 → BT.709 gamut matrix in linear light
+   - Hable (Uncharted 2) tone-mapper
+   - sRGB OETF (gamma encode)
 3. **Scoring** — each candidate frame is scored on five components:
    | Component | Weight | What it measures |
-   |-----------|--------|-----------------|
+   |-----------|--------|------------------|
    | Pose detected | 0.35 | Shoulders visible and confident |
    | Shoulder visibility | 0.25 | Both landmarks clearly in frame |
    | Blur | 0.15 | Laplacian variance (sharpness) |

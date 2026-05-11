@@ -344,7 +344,55 @@ def cmd_build(args: argparse.Namespace) -> None:
                 video_score_reason     = moment.reason,
             ))
 
-    # ── Save project.json ──────────────────────────────────────────────────
+    # ── Sort all items chronologically and re-number ───────────────────────
+    # Photos and videos were processed separately; merge into one chronological
+    # list before writing project.json so the slideshow plays in date order.
+    def _item_sort_key(it: dict):
+        cap = it.get("capture_date")
+        if cap:
+            try:
+                return datetime.fromisoformat(cap)
+            except ValueError:
+                pass
+        return datetime.max   # items with no date go to the end
+
+    project_items.sort(key=_item_sort_key)
+
+    # Re-number IDs and rename output files to match new order.
+    # Two-phase rename avoids collisions when photo and video index ranges
+    # overlap after sorting (e.g. renaming 0704.png→0339.png would silently
+    # overwrite the existing photo 0339.png in a single-pass loop).
+    #
+    # Phase 1: move every out-of-place file to a safe temporary name.
+    _to_finalize: list[tuple[dict, str]] = []
+    for new_idx, item in enumerate(project_items, 1):
+        new_id = f"{new_idx:04d}"
+        old_id = item["id"]
+        # Always update the path strings so they reflect the final names.
+        item["id"] = new_id
+        item["outputs"]["aligned_frame"] = str(aligned_dir / f"{new_id}.png")
+        item["outputs"]["debug_frame"]   = str(debug_dir   / f"{new_id}_debug.jpg")
+        if old_id == new_id:
+            continue
+        tmp_aligned = aligned_dir / f"_reorder_{old_id}.png"
+        tmp_debug   = debug_dir   / f"_reorder_{old_id}.jpg"
+        old_aligned = aligned_dir / f"{old_id}.png"
+        old_debug   = debug_dir   / f"{old_id}_debug.jpg"
+        if old_aligned.exists():
+            old_aligned.rename(tmp_aligned)
+        if old_debug.exists():
+            old_debug.rename(tmp_debug)
+        _to_finalize.append((item, tmp_aligned, tmp_debug))
+
+    # Phase 2: rename temporaries to their final names (no collisions possible).
+    for item, tmp_aligned, tmp_debug in _to_finalize:
+        final_aligned = Path(item["outputs"]["aligned_frame"])
+        final_debug   = Path(item["outputs"]["debug_frame"])
+        if tmp_aligned.exists():
+            tmp_aligned.rename(final_aligned)
+        if tmp_debug.exists():
+            tmp_debug.rename(final_debug)
+
     project_json = output_dir / "project.json"
     save_project(
         path                          = project_json,
