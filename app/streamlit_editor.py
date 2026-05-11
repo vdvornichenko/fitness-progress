@@ -829,7 +829,7 @@ with ctrl_col:
                     try:
                         from progress_aligner.video_sampling import (
                             _read_rotation, _rotate_frame,
-                            _probe_hdr, _hdr_heuristic, _tonemap_sdr,
+                            _probe_hdr, _tonemap_sdr,
                         )
                         _cap2 = cv2.VideoCapture(str(vpath))
                         if not _cap2.isOpened():
@@ -852,20 +852,11 @@ with ctrl_col:
                         _cap2.release()
                         if _ret:
                             _bgr = _rotate_frame(_bgr, _rotation)
-                            # Two-tier HDR detection — same logic as sample_frames():
-                            # lower threshold when ffprobe confirmed HDR (catches
-                            # bad VideoToolbox decodes), high threshold otherwise.
-                            from progress_aligner.video_sampling import (
-                                _HDR_LUMINANCE_THRESHOLD_CONFIRMED,
-                                _HDR_LUMINANCE_THRESHOLD_UNKNOWN,
-                            )
-                            _hdr_thresh = (
-                                _HDR_LUMINANCE_THRESHOLD_CONFIRMED if _is_hdr
-                                else _HDR_LUMINANCE_THRESHOLD_UNKNOWN
-                            )
-                            if _hdr_heuristic(_bgr, _hdr_thresh):
+                            # When ffprobe confirmed HDR, always tone-map.
+                            # VideoToolbox decodes without BT.2020→BT.709 gamut
+                            # conversion; our pipeline restores correct colours.
+                            if _is_hdr:
                                 _bgr = _tonemap_sdr(_bgr)
-                                _hdr_tag = _hdr_tag or "heuristic"
                             # Convert to RGB and run shoulder detection + alignment
                             _rgb = cv2.cvtColor(_bgr, cv2.COLOR_BGR2RGB)
                             _settings = proj.get("settings", {})

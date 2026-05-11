@@ -99,12 +99,19 @@ _HDR_TRANSFERS: frozenset[str] = frozenset({
 })
 
 # Heuristic thresholds for detecting washed-out HDR frames.
-# When ffprobe has already confirmed HDR content, we use a *low* threshold
-# so we still catch frames where VideoToolbox did a partial (bad) decode.
-# For unknown/SDR content we use a high threshold to avoid false positives
-# on legitimately bright scenes.
-_HDR_LUMINANCE_THRESHOLD_CONFIRMED = 130.0   # ffprobe said HDR
-_HDR_LUMINANCE_THRESHOLD_UNKNOWN   = 175.0   # ffprobe absent / said SDR
+#
+# IMPORTANT — macOS / VideoToolbox note:
+# cv2.VideoCapture uses VideoToolbox on macOS, which ALWAYS converts HDR
+# content to SDR (BT.709 / sRGB) before handing bytes to OpenCV.  Applying
+# the PQ EOTF to already-SDR data produces near-black output, making the
+# frame look grey.  Therefore _HDR_LUMINANCE_THRESHOLD_UNKNOWN is set very
+# high (210) so the heuristic never fires when ffprobe is absent.
+#
+# The lower confirmed threshold (125) is reserved for a future setup where
+# ffmpeg (not VideoCapture) is used as decoder and actually delivers raw
+# PQ-encoded bytes — in that case the mean of a PQ frame sits above 150.
+_HDR_LUMINANCE_THRESHOLD_CONFIRMED = 125.0   # ffprobe said HDR + raw PQ decoder
+_HDR_LUMINANCE_THRESHOLD_UNKNOWN   = 210.0   # ffprobe absent — VideoToolbox SDR output
 
 
 def _probe_hdr(path: Path) -> tuple[bool, str]:
@@ -136,38 +143,105 @@ def _probe_hdr(path: Path) -> tuple[bool, str]:
         return False, ""
 
 
-def _hdr_heuristic(bgr: np.ndarray, threshold: float = 175.0) -> bool:
-    """Return True if the frame looks washed-out (likely PQ-encoded HDR)."""
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+def _hdr_heuristic(bgr: np.ndarray, threshold: float = 210.0) -> bool:
+    """Return True if the frame looks like washed-out PQ-encoded HDR.
+
+    Only the mean-brightness test is used.  On macOS with VideoToolbox
+    (the OpenCV backend) this heuristic is intentionally set to a very high
+    threshold (210) so it never fires — VideoToolbox already converts HDR to
+    SDR, and applying the PQ pipeline again would produce grey output.
+    When a raw-PQ decoder such as ffmpeg is used the mean of an HDR10 frame
+    sits above ~150, so a threshold of 125 is appropriate in that context.
+    """
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
     return float(gray.mean()) > threshold
 
 
-def _tonemap_sdr(bgr: np.ndarray) -> np.ndarray:
-    """
-    Tone-map a washed-out HDR-sourced 8-bit frame to a natural SDR appearance.
+# ── PQ (ST 2084) EOTF constants ───────────────────────────────────────────
+_PQ_C1 = 0.8359375        # 3424 / 4096
+_PQ_C2 = 18.8515625       # 2413 / 4096 × 32
+_PQ_C3 = 18.6875          # 2415 / 4096 × 32
+_PQ_M1 = 0.1593017578125  # 2610 / (4096 × 4)
+_PQ_M2 = 78.84375         # 2523 / (4096 × 32)
 
-    HDR10/PQ frames read by OpenCV appear pale because the PQ transfer curve
-    maps content to the upper half of the 8-bit range.  We apply a
-    luminance-preserving Reinhard operator: the compression scale is computed
-    from the per-pixel maximum channel (a hue-safe luminance proxy) and then
-    applied uniformly to all three channels, which keeps hue and saturation
-    intact.  Finally we stretch to the full [0, 255] range and apply sRGB
-    gamma encoding.
+
+def _pq_eotf(v: np.ndarray) -> np.ndarray:
+    """PQ (ST 2084) EOTF: signal [0, 1] → linear scene light [0, 1]."""
+    v    = v.clip(0.0, 1.0)
+    v_m2 = np.power(v, 1.0 / _PQ_M2)
+    num  = np.maximum(v_m2 - _PQ_C1, 0.0)
+    den  = np.maximum(_PQ_C2 - _PQ_C3 * v_m2, 1e-10)
+    return np.power(num / den, 1.0 / _PQ_M1)
+
+
+def _hable(v: np.ndarray) -> np.ndarray:
+    """Uncharted 2 / Hable tone-map curve.
+
+    Scale factor 150 matches the fast-hdr reference implementation
+    (``gen/hdr_sdr_gen.cpp``).  Applied per channel independently.
     """
-    f = bgr.astype(np.float32) / 255.0
-    # Per-pixel luminance proxy: maximum of the three channels
-    lum = f.max(axis=2, keepdims=True).clip(min=1e-6)
-    # Reinhard on luminance only: lum_out = lum / (1 + lum)
-    lum_out = lum / (1.0 + lum)
-    # Apply the same scale to all channels to preserve hue/saturation
-    f = f * (lum_out / lum)
-    # Stretch so the brightest pixel reaches 1.0
-    peak = f.max()
-    if peak > 1e-6:
-        f /= peak
-    # Apply sRGB display gamma (~2.2)
-    f = np.power(np.clip(f, 0.0, 1.0), 1.0 / 2.2)
-    return (f * 255.0).astype(np.uint8)
+    v = v * 150.0
+    A, B, C, D, E, F = 0.15, 0.50, 0.10, 0.20, 0.02, 0.30
+    return ((v * (A * v + C * B) + D * E) / (v * (A * v + B) + D * F)) - E / F
+
+
+def _srgb_oetf(v: np.ndarray) -> np.ndarray:
+    """Proper piecewise sRGB OETF (linear → gamma-encoded display signal)."""
+    return np.where(
+        v <= 0.0031308,
+        v * 12.92,
+        1.055 * np.power(v.clip(min=0.0031308), 1.0 / 2.4) - 0.055,
+    )
+
+
+# BT.2020 → BT.709 colour-primary matrix (applied in linear light).
+# Source: ITU-R BT.2087-0, Table 2.
+# Row order: R, G, B.  Input is BGR so we apply to a RGB view and convert back.
+_BT2020_TO_BT709 = np.array(
+    [
+        [ 1.6605, -0.5876, -0.0728],
+        [-0.1246,  1.1329, -0.0083],
+        [-0.0182, -0.1006,  1.1187],
+    ],
+    dtype=np.float32,
+)
+
+
+def _bt2020_to_bt709(linear_bgr: np.ndarray) -> np.ndarray:
+    """Convert linear BT.2020 RGB to linear BT.709 RGB.
+
+    Input / output are both in BGR channel order (as used by OpenCV).
+    Applied before tone-mapping so out-of-gamut primaries are compressed
+    into the BT.709 gamut, restoring colour saturation that VideoToolbox
+    loses when it decodes an HDR10/BT.2020 stream without gamut mapping.
+    """
+    # Work in RGB order to match the matrix row convention
+    rgb = linear_bgr[:, :, ::-1]                     # BGR → RGB view
+    h, w = rgb.shape[:2]
+    rgb_flat = rgb.reshape(-1, 3) @ _BT2020_TO_BT709.T
+    rgb_out  = rgb_flat.reshape(h, w, 3).clip(0.0, None)
+    return rgb_out[:, :, ::-1]                        # RGB → BGR
+
+
+def _tonemap_sdr(bgr: np.ndarray) -> np.ndarray:
+    """Convert a washed-out PQ-encoded 8-bit frame to a natural SDR appearance.
+
+    Pipeline:
+      1. Normalise 8-bit → [0, 1] signal space
+      2. PQ (ST 2084) EOTF      → linear BT.2020 scene light  (per channel)
+      3. BT.2020 → BT.709 gamut matrix (linear light) — restores saturation
+      4. Hable "Uncharted 2" tone-map × 150 scale      (per channel)
+      5. sRGB OETF               → display-ready sRGB   (per channel)
+
+    Input: 8-bit BGR as delivered by OpenCV / VideoToolbox from an HDR10 video.
+    Output: 8-bit BGR ready for normal sRGB display.
+    """
+    f      = bgr.astype(np.float32) / 255.0
+    lin    = _pq_eotf(f)                  # → linear BT.2020
+    lin709 = _bt2020_to_bt709(lin)        # → linear BT.709
+    tone   = _hable(lin709)               # Hable tone-map
+    sdr    = _srgb_oetf(tone)             # → sRGB
+    return (sdr.clip(0.0, 1.0) * 255.0).astype(np.uint8)
 
 
 def get_video_info(path: Path) -> VideoInfo:
@@ -244,25 +318,19 @@ def sample_frames(
 
     rotation = _read_rotation(cap)
 
-    # Determine tone-mapping need from the first decoded frame.
-    #
-    # Strategy: two-tier detection.
-    # • When ffprobe confirmed HDR, use a *lower* luminance threshold (130):
-    #   the frame is expected to be washed-out; VideoToolbox sometimes does a
-    #   correct decode (mean ~90-120, skip) and sometimes a bad one
-    #   (mean ~130-180, apply).  The lower threshold catches the bad decode
-    #   while still letting a correctly-decoded frame pass unmolested.
-    # • When the stream is unknown/SDR, use a high threshold (175) as a
-    #   safety net for mislabelled content, avoiding false positives on
-    #   bright gym lighting.
-    # • We sample the first two frames (when available) and apply tone-mapping
-    #   if either exceeds the threshold, to handle dark opening frames.
-    threshold = (
-        _HDR_LUMINANCE_THRESHOLD_CONFIRMED if is_hdr
-        else _HDR_LUMINANCE_THRESHOLD_UNKNOWN
-    )
-    apply_tonemap: bool = False  # set from the first (and optionally second) frame
-    _probe_frames_remaining: int = 2  # check up to 2 frames before locking in
+    # Tone-mapping strategy:
+    # • ffprobe confirmed HDR (is_hdr=True): ALWAYS apply _tonemap_sdr().
+    #   VideoToolbox decodes the PQ/BT.2020 stream but does not fully convert
+    #   to sRGB; our pipeline (PQ EOTF → BT.2020→BT.709 → Hable → sRGB)
+    #   restores correct colours.
+    # • Unknown/SDR (is_hdr=False): use a luminance heuristic as a safety net
+    #   for mislabelled content — only fires if mean > 210 (essentially never
+    #   for normally-decoded SDR footage).
+    if is_hdr:
+        apply_tonemap = True
+    else:
+        apply_tonemap = False   # may be set to True by the heuristic below
+    _probe_frames_remaining: int = 2  # used only for the SDR heuristic path
 
     candidates: list[CandidateFrame] = []
     for idx, ts in enumerate(timestamps):
@@ -271,9 +339,9 @@ def sample_frames(
         if not ret:
             continue
         bgr = _rotate_frame(bgr, rotation)
-        if _probe_frames_remaining > 0:
+        if not is_hdr and _probe_frames_remaining > 0:
             _probe_frames_remaining -= 1
-            if _hdr_heuristic(bgr, threshold):
+            if _hdr_heuristic(bgr, _HDR_LUMINANCE_THRESHOLD_UNKNOWN):
                 apply_tonemap = True
         if apply_tonemap:
             bgr = _tonemap_sdr(bgr)
